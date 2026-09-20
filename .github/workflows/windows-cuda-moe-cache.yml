@@ -95,12 +95,12 @@ jobs:
             throw 'CMake configuration failed'
           }
 
-      - name: Build all useful Release targets
+      - name: Build llama-server Release target
         shell: pwsh
         run: |
-          cmake --build build --config Release --parallel
+          cmake --build build --config Release --target llama-server --parallel
           if ($LASTEXITCODE -ne 0) {
-            throw 'Release build failed'
+            throw 'Release llama-server build failed'
           }
 
       - name: Assemble runnable Windows package and verify MoE-cache flags
@@ -131,16 +131,24 @@ jobs:
           foreach ($dll in $crt) {
             Copy-Item -LiteralPath $dll.FullName -Destination $package -Force
           }
-          $server = Get-ChildItem -Path $package -Recurse -Filter 'llama-server.exe' -File | Select-Object -First 1
+          $server = Get-Item (Join-Path $package 'llama-server.exe') -ErrorAction SilentlyContinue
           if (-not $server) {
-            throw 'llama-server.exe was not produced'
+            throw 'Flattened llama-server.exe was not produced'
           }
+          Write-Host "Testing server executable: $($server.FullName)"
           $help = (& $server.FullName --help 2>&1 | Out-String)
+          $helpExit = $LASTEXITCODE
+          Write-Host "llama-server --help exit code: $helpExit"
           $help | Set-Content -Path (Join-Path $package 'llama-server-help.txt') -Encoding utf8
           $moeLines = $help -split '\r?\n' | Where-Object { $_ -match '--moe-' }
           $moeLines | Set-Content -Path (Join-Path $package 'moe-cache-flags.txt') -Encoding utf8
+          if ($helpExit -ne 0) {
+            Write-Host $help
+            throw 'llama-server --help failed to start from the flattened runnable package'
+          }
           foreach ($flag in @('--moe-expert-cache-size', '--moe-expert-cache-host-pinned-mb')) {
             if ($help -notmatch [regex]::Escape($flag)) {
+              Write-Host $help
               throw "Required MoE-cache flag missing from llama-server --help: $flag"
             }
           }
@@ -161,6 +169,7 @@ jobs:
           GGML_CUDA: ON
           CMAKE_CUDA_ARCHITECTURES: $env:CUDA_ARCHS
           CUDA architecture probe: $env:CUDA_ARCH_PROBE
+          Build target: llama-server
           Required MoE-cache flags: present
           "@ | Set-Content -Path (Join-Path $package 'BUILD-METADATA.txt') -Encoding utf8
 
