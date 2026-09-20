@@ -20,7 +20,6 @@ jobs:
       SOURCE_BRANCH: moe-cache
       SOURCE_SHA: a461dd9c5db5628295ac65481c6b41c8cb45c210
       CUDA_ARCHS: 89;120
-
     steps:
       - name: Check out the exact moe-cache commit
         uses: actions/checkout@v4
@@ -43,11 +42,20 @@ jobs:
         shell: pwsh
         run: |
           $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
-          if (-not (Test-Path $vswhere)) { throw 'vswhere.exe was not found on the Windows runner' }
+          if (-not (Test-Path $vswhere)) {
+            throw 'vswhere.exe was not found on the Windows runner'
+          }
           $vsPath = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
-          if (-not $vsPath) { throw 'No MSVC x64 toolchain was found on the Windows runner' }
-          $cl = Get-ChildItem (Join-Path $vsPath 'VC/Tools/MSVC') -Recurse -Filter cl.exe | Where-Object { $_.FullName -like '*\Hostx64\x64\cl.exe' } | Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $cl) { throw "No Hostx64/x64 cl.exe found below $vsPath" }
+          if (-not $vsPath) {
+            throw 'No MSVC x64 toolchain was found on the Windows runner'
+          }
+          $cl = Get-ChildItem (Join-Path $vsPath 'VC/Tools/MSVC') -Recurse -Filter cl.exe |
+            Where-Object { $_.FullName -like '*\Hostx64\x64\cl.exe' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $cl) {
+            throw "No Hostx64/x64 cl.exe found below $vsPath"
+          }
           "VS_INSTALLATION_PATH=$vsPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CL_EXE=$($cl.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $vsVersion = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property catalog_productDisplayVersion).Trim()
@@ -65,12 +73,14 @@ jobs:
         shell: pwsh
         run: |
           $nvcc = Join-Path $env:CUDA_PATH 'bin/nvcc.exe'
-          if (-not (Test-Path $nvcc)) { throw "nvcc was not found at $nvcc" }
+          if (-not (Test-Path $nvcc)) {
+            throw "nvcc was not found at $nvcc"
+          }
           & $nvcc --version
           $probeCu = Join-Path $env:RUNNER_TEMP 'cuda_arch_probe.cu'
           $probeObj = Join-Path $env:RUNNER_TEMP 'cuda_arch_probe.obj'
           'extern "C" __global__ void cuda_arch_probe() {}' | Set-Content -Path $probeCu -Encoding ascii
-          & $nvcc -ccbin $env:CL_EXE  '-gencode=arch=compute_89,code=sm_89' -c $probeCu -o $probeObj
+          & $nvcc -ccbin $env:CL_EXE '-gencode=arch=compute_89,code=sm_89' '-gencode=arch=compute_120,code=sm_120' -c $probeCu -o $probeObj
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path $probeObj)) {
             throw 'CUDA Toolkit verification failed for sm_89 and/or sm_120'
           }
@@ -80,61 +90,62 @@ jobs:
       - name: Configure Release CUDA build with CMake
         shell: pwsh
         run: |
-          cmake -S . -B build -G 'Visual Studio 17 2022'  -DCMAKE_CUDA_ARCHITECTURES="$env:CUDA_ARCHS" -DGGML_CUDA=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TOOLS=ON
-          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+          cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 -DCMAKE_GENERATOR_INSTANCE="$env:VS_INSTALLATION_PATH" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$env:CUDA_ARCHS" -DGGML_CUDA=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TOOLS=ON
+          if ($LASTEXITCODE -ne 0) {
+            throw 'CMake configuration failed'
+          }
 
       - name: Build all useful Release targets
         shell: pwsh
         run: |
           cmake --build build --config Release --parallel
-          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Release build failed'
+          }
 
       - name: Assemble runnable Windows package and verify MoE-cache flags
         shell: pwsh
         run: |
           $package = Join-Path $env:GITHUB_WORKSPACE 'package'
-          if (Test-Path $package) { Remove-Item $package -Recurse -Force }
+          if (Test-Path $package) {
+            Remove-Item $package -Recurse -Force
+          }
           New-Item -ItemType Directory -Path $package | Out-Null
           cmake --install build --config Release --prefix $package
-          if ($LASTEXITCODE -ne 0) { throw 'CMake install failed' }
-
-          # Flatten all Release DLLs and executables emitted by this exact build into the package root.
-          $releaseFiles = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE 'build') -Recurse -File | Where-Object {
-            $_.Extension -in @('.dll', '.exe', '.pdb') -and $_.FullName -like '*\Release\*'
+          if ($LASTEXITCODE -ne 0) {
+            throw 'CMake install failed'
           }
+          $releaseFiles = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE 'build') -Recurse -File |
+            Where-Object { $_.Extension -in @('.dll', '.exe', '.pdb') -and $_.FullName -like '*\Release\*' }
           foreach ($file in $releaseFiles) {
             Copy-Item -LiteralPath $file.FullName -Destination $package -Force
           }
-
-          # Bundle CUDA runtime DLLs from the selected CUDA 13.2.0 toolkit, never from upstream or a release archive.
           $cudaBin = Join-Path $env:CUDA_PATH 'bin'
-          $cudaRuntime = Get-ChildItem -Path $cudaBin -File -Filter '*.dll' | Where-Object {
-            $_.Name -match '^(cudart|cublas|cublasLt|curand|cufft|cusolver|cusparse|nvJitLink|nvrtc|nvToolsExt).*\.dll$'
-          }
+          $cudaRuntime = Get-ChildItem -Path $cudaBin -File -Filter '*.dll' |
+            Where-Object { $_.Name -match '^(cudart|cublas|cublasLt|curand|cufft|cusolver|cusparse|nvJitLink|nvrtc|nvToolsExt).*\.dll$' }
           foreach ($dll in $cudaRuntime) {
             Copy-Item -LiteralPath $dll.FullName -Destination $package -Force
           }
-
-          # Bundle the x64 MSVC runtime from the runner's installed Visual Studio redist.
-          $crt = Get-ChildItem -Path (Join-Path $env:VS_INSTALLATION_PATH 'VC/Redist/MSVC') -Recurse -File | Where-Object {
-            $_.FullName -like '*\x64\Microsoft.VC*.CRT\*' -and $_.Name -match '^(msvcp140|vcruntime140|concrt140).*\.dll$'
-          }
+          $crt = Get-ChildItem -Path (Join-Path $env:VS_INSTALLATION_PATH 'VC/Redist/MSVC') -Recurse -File |
+            Where-Object { $_.FullName -like '*\x64\Microsoft.VC*.CRT\*' -and $_.Name -match '^(msvcp140|vcruntime140|concrt140).*\.dll$' }
           foreach ($dll in $crt) {
             Copy-Item -LiteralPath $dll.FullName -Destination $package -Force
           }
-
           $server = Get-ChildItem -Path $package -Recurse -Filter 'llama-server.exe' -File | Select-Object -First 1
-          if (-not $server) { throw 'llama-server.exe was not produced' }
+          if (-not $server) {
+            throw 'llama-server.exe was not produced'
+          }
           $help = (& $server.FullName --help 2>&1 | Out-String)
           $help | Set-Content -Path (Join-Path $package 'llama-server-help.txt') -Encoding utf8
           $moeLines = $help -split '\r?\n' | Where-Object { $_ -match '--moe-' }
           $moeLines | Set-Content -Path (Join-Path $package 'moe-cache-flags.txt') -Encoding utf8
           foreach ($flag in @('--moe-expert-cache-size', '--moe-expert-cache-host-pinned-mb')) {
-            if ($help -notmatch [regex]::Escape($flag)) { throw "Required MoE-cache flag missing from llama-server --help: $flag" }
+            if ($help -notmatch [regex]::Escape($flag)) {
+              throw "Required MoE-cache flag missing from llama-server --help: $flag"
+            }
           }
           Write-Host 'MoE-cache CLI flags found:'
           $moeLines | ForEach-Object { Write-Host $_ }
-
           $cudaVersion = (& (Join-Path $env:CUDA_PATH 'bin/nvcc.exe') --version | Select-String 'release').Line.Trim()
           $runnerVersion = "$env:ImageOS $env:ImageVersion"
           @"
@@ -157,9 +168,13 @@ jobs:
         shell: pwsh
         run: |
           $zip = Join-Path $env:GITHUB_WORKSPACE "llama.cpp-windows-cuda-moe-cache-$env:BUILT_COMMIT.zip"
-          if (Test-Path $zip) { Remove-Item $zip -Force }
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
           Compress-Archive -Path (Join-Path $env:GITHUB_WORKSPACE 'package/*') -DestinationPath $zip -CompressionLevel Optimal
-          if (-not (Test-Path $zip)) { throw 'ZIP creation failed' }
+          if (-not (Test-Path $zip)) {
+            throw 'ZIP creation failed'
+          }
           $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash
           Write-Host "ZIP: $zip"
           Write-Host "SHA256: $hash"
