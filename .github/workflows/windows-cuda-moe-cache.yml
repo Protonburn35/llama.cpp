@@ -70,7 +70,7 @@ jobs:
           $probeCu = Join-Path $env:RUNNER_TEMP 'cuda_arch_probe.cu'
           $probeObj = Join-Path $env:RUNNER_TEMP 'cuda_arch_probe.obj'
           'extern "C" __global__ void cuda_arch_probe() {}' | Set-Content -Path $probeCu -Encoding ascii
-          & $nvcc -ccbin $env:CL_EXE -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_120,code=sm_120 -c $probeCu -o $probeObj
+          & $nvcc -ccbin $env:CL_EXE  '-gencode=arch=compute_89,code=sm_89' -c $probeCu -o $probeObj
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path $probeObj)) {
             throw 'CUDA Toolkit verification failed for sm_89 and/or sm_120'
           }
