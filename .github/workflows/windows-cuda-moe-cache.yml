@@ -55,10 +55,10 @@ jobs:
           Write-Host "Using Visual Studio $vsVersion at $vsPath"
           Write-Host "Using compiler $($cl.FullName)"
 
-      - name: Install CUDA Toolkit 
-        uses: 
+      - name: Install CUDA Toolkit 13.2.0
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: ''
+          cuda: '13.2.0'
           method: network
 
       - name: Verify CUDA can compile sm_89 and sm_120
@@ -106,7 +106,7 @@ jobs:
             Copy-Item -LiteralPath $file.FullName -Destination $package -Force
           }
 
-          # Bundle CUDA runtime DLLs from the selected CUDA  toolkit, never from upstream or a release archive.
+          # Bundle CUDA runtime DLLs from the selected CUDA 13.2.0 toolkit, never from upstream or a release archive.
           $cudaBin = Join-Path $env:CUDA_PATH 'bin'
           $cudaRuntime = Get-ChildItem -Path $cudaBin -File -Filter '*.dll' | Where-Object {
             $_.Name -match '^(cudart|cublas|cublasLt|curand|cufft|cusolver|cusparse|nvJitLink|nvrtc|nvToolsExt).*\.dll$'
