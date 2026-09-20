@@ -80,7 +80,7 @@ jobs:
       - name: Configure Release CUDA build with CMake
         shell: pwsh
         run: |
-          cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$env:CUDA_ARCHS" -DGGML_CUDA=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TOOLS=ON
+          cmake -S . -B build -G 'Visual Studio 17 2022'  -DCMAKE_CUDA_ARCHITECTURES="$env:CUDA_ARCHS" -DGGML_CUDA=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TOOLS=ON
           if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
 
       - name: Build all useful Release targets
