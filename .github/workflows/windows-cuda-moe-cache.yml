@@ -56,7 +56,7 @@ jobs:
           Write-Host "Using compiler $($cl.FullName)"
 
       - name: Install CUDA Toolkit 
-        uses: Jimver/cuda-toolkit@v0.2.27
+        uses: 
         with:
           cuda: ''
           method: network
