@@ -1,5 +1,4 @@
 name: Windows CUDA MoE-cache Release
-
 on:
   workflow_dispatch:
   push:
@@ -7,10 +6,8 @@ on:
       - llama/main
     paths:
       - .github/workflows/windows-cuda-moe-cache.yml
-
 permissions:
   contents: read
-
 jobs:
   build:
     name: Build llama.cpp Windows CUDA Release
@@ -27,7 +24,6 @@ jobs:
           repository: Protonburn35/llama.cpp
           ref: a461dd9c5db5628295ac65481c6b41c8cb45c210
           fetch-depth: 0
-
       - name: Record the exact source commit
         shell: pwsh
         run: |
@@ -37,7 +33,6 @@ jobs:
           }
           "BUILT_COMMIT=$actual" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Building $env:SOURCE_REPOSITORY/$env:SOURCE_BRANCH at $actual"
-
       - name: Select the installed MSVC toolchain
         shell: pwsh
         run: |
@@ -62,13 +57,11 @@ jobs:
           "MSVC_VERSION=$vsVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Using Visual Studio $vsVersion at $vsPath"
           Write-Host "Using compiler $($cl.FullName)"
-
       - name: Install CUDA Toolkit 13.2.0
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: '13.2.0'
           method: network
-
       - name: Verify CUDA can compile sm_89 and sm_120
         shell: pwsh
         run: |
@@ -86,7 +79,6 @@ jobs:
           }
           "CUDA_ARCH_PROBE=PASS (sm_89, sm_120)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host 'CUDA Toolkit verified: sm_89 and sm_120 both compile.'
-
       - name: Configure Release CUDA build with CMake
         shell: pwsh
         run: |
@@ -94,7 +86,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'CMake configuration failed'
           }
-
       - name: Build llama-server Release target
         shell: pwsh
         run: |
@@ -102,7 +93,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'Release llama-server build failed'
           }
-
       - name: Assemble runnable Windows package and verify MoE-cache flags
         shell: pwsh
         run: |
@@ -112,19 +102,17 @@ jobs:
           }
           New-Item -ItemType Directory -Path $package | Out-Null
           $releaseFiles = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE 'build') -Recurse -File |
-        
             Where-Object { $_.Extension -in @('.dll', '.exe', '.pdb') -and $_.FullName -like '*\Release\*' }
           foreach ($file in $releaseFiles) {
             Copy-Item -LiteralPath $file.FullName -Destination $package -Force
           }
           $cudaBin = Join-Path $env:CUDA_PATH 'bin'
-          $cudaRuntime = Get-ChildItem -Path $cudaBin -File -Filter '*.dll' |
-            Where-Object { $_.Name -match '^(cudart|cublas|cublasLt|curand|cufft|cusolver|cusparse|nvJitLink|nvrtc|nvToolsExt).*\.dll$' }
+          $cudaRuntime = Get-ChildItem -Path $cudaBin -File -Filter '*.dll'
           foreach ($dll in $cudaRuntime) {
             Copy-Item -LiteralPath $dll.FullName -Destination $package -Force
           }
-          $crt = Get-ChildItem -Path (Join-Path $env:VS_INSTALLATION_PATH 'VC/Redist/MSVC') -Recurse -File |
-            Where-Object { $_.FullName -like '*\x64\Microsoft.VC*.CRT\*' -and $_.Name -match '^(msvcp140|vcruntime140|concrt140).*\.dll$' }
+          $crt = Get-ChildItem -Path (Join-Path $env:VS_INSTALLATION_PATH 'VC/Redist/MSVC') -Recurse -File -Filter '*.dll' |
+            Where-Object { $_.FullName -like '*\x64\Microsoft.VC*.CRT\*' }
           foreach ($dll in $crt) {
             Copy-Item -LiteralPath $dll.FullName -Destination $package -Force
           }
@@ -169,7 +157,6 @@ jobs:
           Build target: llama-server
           Required MoE-cache flags: present
           "@ | Set-Content -Path (Join-Path $package 'BUILD-METADATA.txt') -Encoding utf8
-
       - name: Create the ZIP artifact
         shell: pwsh
         run: |
@@ -184,7 +171,6 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash
           Write-Host "ZIP: $zip"
           Write-Host "SHA256: $hash"
-
       - name: Upload the complete Windows Release ZIP
         uses: actions/upload-artifact@v4
         with:
