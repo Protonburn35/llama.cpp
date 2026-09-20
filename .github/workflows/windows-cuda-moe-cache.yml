@@ -111,11 +111,7 @@ jobs:
             Remove-Item $package -Recurse -Force
           }
           New-Item -ItemType Directory -Path $package | Out-Null
-          cmake --install build --config Release --prefix $package
-          if ($LASTEXITCODE -ne 0) {
-            throw 'CMake install failed'
-          }
-          $releaseFiles = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE 'build') -Recurse -File |
+        
             Where-Object { $_.Extension -in @('.dll', '.exe', '.pdb') -and $_.FullName -like '*\Release\*' }
           foreach ($file in $releaseFiles) {
             Copy-Item -LiteralPath $file.FullName -Destination $package -Force
