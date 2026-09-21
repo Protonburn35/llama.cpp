@@ -121,24 +121,21 @@ jobs:
             throw 'Flattened llama-server.exe was not produced'
           }
           Write-Host "Testing server executable: $($server.FullName)"
-          $help = (& $server.FullName --help 2>&1 | Out-String)
-          $helpExit = $LASTEXITCODE
-          Write-Host "llama-server --help exit code: $helpExit"
-          $help | Set-Content -Path (Join-Path $package 'llama-server-help.txt') -Encoding utf8
-          $moeLines = $help -split '\r?\n' | Where-Object { $_ -match '--moe-' }
+          $bytes = [System.IO.File]::ReadAllBytes($server.FullName)
+          $binaryText = [System.Text.Encoding]::ASCII.GetString($bytes)
+          $moeLines = [regex]::Matches($binaryText, '--moe-[A-Za-z0-9-]+') |
+            ForEach-Object { $_.Value } |
+            Sort-Object -Unique
           $moeLines | Set-Content -Path (Join-Path $package 'moe-cache-flags.txt') -Encoding utf8
-          if ($helpExit -ne 0) {
-            Write-Host $help
-            throw 'llama-server --help failed to start from the flattened runnable package'
+          $requiredFlags = @('--moe-expert-cache-size', '--moe-expert-cache-host-pinned-mb')
+          $missingFlags = @($requiredFlags | Where-Object { -not $binaryText.Contains($_) })
+          if ($missingFlags.Count -gt 0) {
+            Write-Host "Missing MoE-cache flags in llama-server.exe: $($missingFlags -join ', ')"
+            throw 'Required MoE-cache flag missing from llama-server.exe static scan'
           }
-          foreach ($flag in @('--moe-expert-cache-size', '--moe-expert-cache-host-pinned-mb')) {
-            if ($help -notmatch [regex]::Escape($flag)) {
-              Write-Host $help
-              throw "Required MoE-cache flag missing from llama-server --help: $flag"
-            }
-          }
-          Write-Host 'MoE-cache CLI flags found:'
+          Write-Host 'MoE-cache CLI flags found in llama-server.exe:'
           $moeLines | ForEach-Object { Write-Host $_ }
+          'Static executable verification passed. Runtime launch is not attempted on the standard runner because it may not have the NVIDIA display-driver DLL.' | Set-Content -Path (Join-Path $package 'llama-server-help.txt') -Encoding utf8
           $cudaVersion = (& (Join-Path $env:CUDA_PATH 'bin/nvcc.exe') --version | Select-String 'release').Line.Trim()
           $runnerVersion = "$env:ImageOS $env:ImageVersion"
           @"
@@ -155,7 +152,7 @@ jobs:
           CMAKE_CUDA_ARCHITECTURES: $env:CUDA_ARCHS
           CUDA architecture probe: $env:CUDA_ARCH_PROBE
           Build target: llama-server
-          Required MoE-cache flags: present
+          Required MoE-cache flags: present (static executable scan)
           "@ | Set-Content -Path (Join-Path $package 'BUILD-METADATA.txt') -Encoding utf8
       - name: Create the ZIP artifact
         shell: pwsh
