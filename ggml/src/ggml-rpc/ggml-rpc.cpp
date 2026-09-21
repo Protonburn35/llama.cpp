@@ -5,7 +5,10 @@
 #include "transport.h"
 
 #include <array>
+#include <cerrno>
+#include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <vector>
@@ -85,6 +88,349 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
+
+static bool rpc_profile_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("GGML_RPC_PROFILE");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+static uint64_t rpc_profile_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static uint64_t rpc_profile_interval() {
+    static const uint64_t interval = []() {
+        const char * value = std::getenv("GGML_RPC_PROFILE_INTERVAL");
+        if (value == nullptr || value[0] == '\0') {
+            return uint64_t(0);
+        }
+        if (value[0] == '-' || value[0] == '+') {
+            GGML_LOG_WARN("Ignoring invalid GGML_RPC_PROFILE_INTERVAL='%s'\n", value);
+            return uint64_t(0);
+        }
+
+        errno = 0;
+        char * end = nullptr;
+        unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (errno != 0 || end == value || *end != '\0') {
+            GGML_LOG_WARN("Ignoring invalid GGML_RPC_PROFILE_INTERVAL='%s'\n", value);
+            return uint64_t(0);
+        }
+        return uint64_t(parsed);
+    }();
+    return interval;
+}
+
+static const char * rpc_cmd_name(enum rpc_cmd cmd) {
+    switch (cmd) {
+        case RPC_CMD_ALLOC_BUFFER:      return "ALLOC_BUFFER";
+        case RPC_CMD_GET_ALIGNMENT:     return "GET_ALIGNMENT";
+        case RPC_CMD_GET_MAX_SIZE:      return "GET_MAX_SIZE";
+        case RPC_CMD_BUFFER_GET_BASE:   return "BUFFER_GET_BASE";
+        case RPC_CMD_FREE_BUFFER:       return "FREE_BUFFER";
+        case RPC_CMD_BUFFER_CLEAR:      return "BUFFER_CLEAR";
+        case RPC_CMD_SET_TENSOR:        return "SET_TENSOR";
+        case RPC_CMD_SET_TENSOR_HASH:   return "SET_TENSOR_HASH";
+        case RPC_CMD_GET_TENSOR:        return "GET_TENSOR";
+        case RPC_CMD_COPY_TENSOR:       return "COPY_TENSOR";
+        case RPC_CMD_GRAPH_COMPUTE:     return "GRAPH_COMPUTE";
+        case RPC_CMD_GET_DEVICE_MEMORY: return "GET_DEVICE_MEMORY";
+        case RPC_CMD_INIT_TENSOR:       return "INIT_TENSOR";
+        case RPC_CMD_GET_ALLOC_SIZE:    return "GET_ALLOC_SIZE";
+        case RPC_CMD_HELLO:             return "HELLO";
+        case RPC_CMD_DEVICE_COUNT:      return "DEVICE_COUNT";
+        case RPC_CMD_GRAPH_RECOMPUTE:   return "GRAPH_RECOMPUTE";
+        case RPC_CMD_MEMSET_TENSOR:     return "MEMSET_TENSOR";
+        case RPC_CMD_NONE:              return "NONE";
+        case RPC_CMD_COUNT:             break;
+    }
+    return "UNKNOWN";
+}
+
+struct rpc_call_timing {
+    uint64_t send_ns = 0;
+    uint64_t recv_ns = 0;
+};
+
+struct rpc_profile_cmd_stat {
+    static constexpr size_t SAMPLE_CAPACITY = 4096;
+
+    uint64_t count = 0;
+    uint64_t input_bytes = 0;
+    uint64_t output_bytes = 0;
+    uint64_t queue_ns = 0;
+    uint64_t max_queue_ns = 0;
+    uint64_t send_ns = 0;
+    uint64_t max_send_ns = 0;
+    uint64_t recv_ns = 0;
+    uint64_t max_recv_ns = 0;
+    uint64_t total_ns = 0;
+    uint64_t max_total_ns = 0;
+    uint64_t dispatch_ns = 0;
+    uint64_t max_dispatch_ns = 0;
+    uint64_t remote_graph_ns = 0;
+    uint64_t max_remote_graph_ns = 0;
+    std::vector<uint64_t> total_samples_ns;
+    std::vector<uint64_t> dispatch_samples_ns;
+    std::vector<uint64_t> remote_graph_samples_ns;
+    size_t total_sample_pos = 0;
+    size_t dispatch_sample_pos = 0;
+    size_t remote_graph_sample_pos = 0;
+};
+
+static void rpc_profile_add_sample(std::vector<uint64_t> & samples, size_t & pos, uint64_t value) {
+    if (samples.size() < rpc_profile_cmd_stat::SAMPLE_CAPACITY) {
+        samples.push_back(value);
+        return;
+    }
+    samples[pos] = value;
+    pos = (pos + 1) % samples.size();
+}
+
+static double rpc_profile_p95_ms(const std::vector<uint64_t> & samples) {
+    if (samples.empty()) {
+        return 0.0;
+    }
+    std::vector<uint64_t> sorted = samples;
+    std::sort(sorted.begin(), sorted.end());
+    const size_t index = (sorted.size()*95 + 99)/100 - 1;
+    return sorted[index]/1e6;
+}
+
+static void rpc_profile_atomic_max(std::atomic<uint64_t> & target, uint64_t value) {
+    uint64_t current = target.load(std::memory_order_relaxed);
+    while (current < value &&
+           !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+    }
+}
+
+class rpc_profile_state {
+public:
+    explicit rpc_profile_state(const char * role)
+        : enabled(rpc_profile_enabled()), role(role), start_ns(enabled ? rpc_profile_now_ns() : 0) {
+    }
+
+    bool is_enabled() const {
+        return enabled;
+    }
+
+    void set_endpoint(const std::string & value) {
+        endpoint = value;
+    }
+
+    void add_serialization(uint64_t time_ns, uint64_t bytes) {
+        if (!enabled) {
+            return;
+        }
+        serialization_count.fetch_add(1, std::memory_order_relaxed);
+        serialization_ns.fetch_add(time_ns, std::memory_order_relaxed);
+        serialized_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+
+    void add_tensor_deserialization(uint64_t time_ns) {
+        if (enabled) {
+            tensor_deserializations.fetch_add(1, std::memory_order_relaxed);
+            tensor_deserialization_ns.fetch_add(time_ns, std::memory_order_relaxed);
+        }
+    }
+
+    void record_client(
+            enum rpc_cmd cmd, uint64_t input_bytes, uint64_t output_bytes,
+            uint64_t queue_ns, const rpc_call_timing & timing, uint64_t total_ns) {
+        if (!enabled || cmd >= RPC_CMD_COUNT) {
+            return;
+        }
+        rpc_profile_cmd_stat & stat = commands[cmd];
+        stat.count++;
+        stat.input_bytes += input_bytes;
+        stat.output_bytes += output_bytes;
+        stat.queue_ns += queue_ns;
+        stat.max_queue_ns = std::max(stat.max_queue_ns, queue_ns);
+        stat.send_ns += timing.send_ns;
+        stat.max_send_ns = std::max(stat.max_send_ns, timing.send_ns);
+        stat.recv_ns += timing.recv_ns;
+        stat.max_recv_ns = std::max(stat.max_recv_ns, timing.recv_ns);
+        stat.total_ns += total_ns;
+        stat.max_total_ns = std::max(stat.max_total_ns, total_ns);
+        rpc_profile_add_sample(stat.total_samples_ns, stat.total_sample_pos, total_ns);
+    }
+
+    void record_server(enum rpc_cmd cmd, uint64_t dispatch_ns) {
+        if (!enabled || cmd >= RPC_CMD_COUNT) {
+            return;
+        }
+        rpc_profile_cmd_stat & stat = commands[cmd];
+        stat.count++;
+        stat.dispatch_ns += dispatch_ns;
+        stat.max_dispatch_ns = std::max(stat.max_dispatch_ns, dispatch_ns);
+        rpc_profile_add_sample(stat.dispatch_samples_ns, stat.dispatch_sample_pos, dispatch_ns);
+    }
+
+    void record_remote_graph(enum rpc_cmd cmd, uint64_t time_ns) {
+        if (!enabled || cmd >= RPC_CMD_COUNT) {
+            return;
+        }
+        rpc_profile_cmd_stat & stat = commands[cmd];
+        stat.remote_graph_ns += time_ns;
+        stat.max_remote_graph_ns = std::max(stat.max_remote_graph_ns, time_ns);
+        rpc_profile_add_sample(stat.remote_graph_samples_ns, stat.remote_graph_sample_pos, time_ns);
+    }
+
+    void record_sync_wait(bool event_wait, uint64_t time_ns) {
+        if (!enabled) {
+            return;
+        }
+        if (event_wait) {
+            event_wait_count.fetch_add(1, std::memory_order_relaxed);
+            event_wait_ns.fetch_add(time_ns, std::memory_order_relaxed);
+            rpc_profile_atomic_max(event_wait_max_ns, time_ns);
+        } else {
+            sync_wait_count.fetch_add(1, std::memory_order_relaxed);
+            sync_wait_ns.fetch_add(time_ns, std::memory_order_relaxed);
+            rpc_profile_atomic_max(sync_wait_max_ns, time_ns);
+        }
+    }
+
+    void maybe_report(const socket_ptr & sock) {
+        if (!enabled) {
+            return;
+        }
+        const uint64_t interval = rpc_profile_interval();
+        const uint64_t graph_dispatches = graph_count();
+        if (interval > 0 && graph_dispatches >= last_report_graphs + interval) {
+            report(sock, "periodic");
+            last_report_graphs = graph_dispatches;
+        }
+    }
+
+    void report(const socket_ptr & sock, const char * reason) const {
+        if (!enabled) {
+            return;
+        }
+
+        uint64_t requests = 0;
+        uint64_t input_bytes = 0;
+        uint64_t output_bytes = 0;
+        for (const rpc_profile_cmd_stat & stat : commands) {
+            requests += stat.count;
+            input_bytes += stat.input_bytes;
+            output_bytes += stat.output_bytes;
+        }
+
+        const double elapsed_ms = (rpc_profile_now_ns() - start_ns)/1e6;
+        if (std::strcmp(role, "client") == 0) {
+            GGML_LOG_INFO(
+                "rpc_profile role=%s endpoint=%s reason=%s elapsed_ms=%.3f requests=%" PRIu64
+                " graph_dispatches=%" PRIu64 " input_bytes=%" PRIu64 " output_bytes=%" PRIu64 "\n",
+                role, endpoint.empty() ? "n/a" : endpoint.c_str(), reason, elapsed_ms, requests,
+                graph_count(), input_bytes, output_bytes);
+        } else {
+            GGML_LOG_INFO(
+                "rpc_profile role=%s endpoint=%s reason=%s elapsed_ms=%.3f requests=%" PRIu64
+                " graph_dispatches=%" PRIu64 "\n",
+                role, endpoint.empty() ? "n/a" : endpoint.c_str(), reason, elapsed_ms, requests, graph_count());
+        }
+
+        if (sock != nullptr) {
+            const rpc_transport_stats transport = sock->get_stats();
+            GGML_LOG_INFO(
+                "rpc_profile role=%s transport send_calls=%" PRIu64 " recv_calls=%" PRIu64
+                " bytes_sent=%" PRIu64 " bytes_received=%" PRIu64 " send_ms=%.3f recv_block_ms=%.3f\n",
+                role, transport.send_calls, transport.recv_calls, transport.bytes_sent, transport.bytes_received,
+                transport.send_time_ns/1e6, transport.recv_time_ns/1e6);
+        }
+
+        GGML_LOG_INFO(
+            "rpc_profile role=%s metadata serialization_count=%" PRIu64 " serialized_bytes=%" PRIu64
+            " serialization_ms=%.3f tensor_deserializations=%" PRIu64 " tensor_deserialization_ms=%.3f"
+            " sync_wait_count=%" PRIu64 " sync_wait_ms=%.3f max_sync_wait_ms=%.3f"
+            " event_wait_count=%" PRIu64 " event_wait_ms=%.3f max_event_wait_ms=%.3f\n",
+            role,
+            serialization_count.load(std::memory_order_relaxed),
+            serialized_bytes.load(std::memory_order_relaxed),
+            serialization_ns.load(std::memory_order_relaxed)/1e6,
+            tensor_deserializations.load(std::memory_order_relaxed),
+            tensor_deserialization_ns.load(std::memory_order_relaxed)/1e6,
+            sync_wait_count.load(std::memory_order_relaxed),
+            sync_wait_ns.load(std::memory_order_relaxed)/1e6,
+            sync_wait_max_ns.load(std::memory_order_relaxed)/1e6,
+            event_wait_count.load(std::memory_order_relaxed),
+            event_wait_ns.load(std::memory_order_relaxed)/1e6,
+            event_wait_max_ns.load(std::memory_order_relaxed)/1e6);
+
+        for (int i = 0; i < RPC_CMD_COUNT; ++i) {
+            const rpc_profile_cmd_stat & stat = commands[i];
+            if (stat.count == 0) {
+                continue;
+            }
+            if (std::strcmp(role, "client") == 0) {
+                GGML_LOG_INFO(
+                    "rpc_profile role=%s cmd=%s count=%" PRIu64 " input_bytes=%" PRIu64
+                    " output_bytes=%" PRIu64 " queue_ms=%.3f max_queue_ms=%.3f send_ms=%.3f"
+                    " max_send_ms=%.3f recv_wait_ms=%.3f max_recv_wait_ms=%.3f"
+                    " avg_total_ms=%.3f p95_total_ms=%.3f max_total_ms=%.3f\n",
+                    role, rpc_cmd_name((enum rpc_cmd) i), stat.count, stat.input_bytes, stat.output_bytes,
+                    stat.queue_ns/1e6, stat.max_queue_ns/1e6, stat.send_ns/1e6, stat.max_send_ns/1e6,
+                    stat.recv_ns/1e6, stat.max_recv_ns/1e6,
+                    stat.count > 0 ? stat.total_ns/1e6/stat.count : 0.0,
+                    rpc_profile_p95_ms(stat.total_samples_ns), stat.max_total_ns/1e6);
+            } else {
+                GGML_LOG_INFO(
+                    "rpc_profile role=%s cmd=%s count=%" PRIu64 " dispatch_ms=%.3f"
+                    " p95_dispatch_ms=%.3f max_dispatch_ms=%.3f remote_graph_ms=%.3f"
+                    " p95_remote_graph_ms=%.3f max_remote_graph_ms=%.3f\n",
+                    role, rpc_cmd_name((enum rpc_cmd) i), stat.count,
+                    stat.dispatch_ns/1e6, rpc_profile_p95_ms(stat.dispatch_samples_ns), stat.max_dispatch_ns/1e6,
+                    stat.remote_graph_ns/1e6, rpc_profile_p95_ms(stat.remote_graph_samples_ns),
+                    stat.max_remote_graph_ns/1e6);
+            }
+        }
+    }
+
+private:
+    uint64_t graph_count() const {
+        return commands[RPC_CMD_GRAPH_COMPUTE].count + commands[RPC_CMD_GRAPH_RECOMPUTE].count;
+    }
+
+    bool enabled;
+    const char * role;
+    std::string endpoint;
+    uint64_t start_ns;
+    std::array<rpc_profile_cmd_stat, RPC_CMD_COUNT> commands = {};
+    std::atomic<uint64_t> serialization_count = 0;
+    std::atomic<uint64_t> serialization_ns = 0;
+    std::atomic<uint64_t> serialized_bytes = 0;
+    std::atomic<uint64_t> tensor_deserializations = 0;
+    std::atomic<uint64_t> tensor_deserialization_ns = 0;
+    std::atomic<uint64_t> sync_wait_count = 0;
+    std::atomic<uint64_t> sync_wait_ns = 0;
+    std::atomic<uint64_t> sync_wait_max_ns = 0;
+    std::atomic<uint64_t> event_wait_count = 0;
+    std::atomic<uint64_t> event_wait_ns = 0;
+    std::atomic<uint64_t> event_wait_max_ns = 0;
+    uint64_t last_report_graphs = 0;
+};
+
+class rpc_profile_deserialize_timer {
+public:
+    explicit rpc_profile_deserialize_timer(rpc_profile_state & profile)
+        : profile(profile), start_ns(profile.is_enabled() ? rpc_profile_now_ns() : 0) {
+    }
+
+    ~rpc_profile_deserialize_timer() {
+        if (start_ns != 0) {
+            profile.add_tensor_deserialization(rpc_profile_now_ns() - start_ns);
+        }
+    }
+
+private:
+    rpc_profile_state & profile;
+    uint64_t start_ns;
+};
 
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
@@ -306,37 +652,55 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+static bool send_rpc_cmd(
+        socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size,
+        rpc_call_timing * timing = nullptr) {
+    const uint64_t start_ns = timing != nullptr ? rpc_profile_now_ns() : 0;
+    const auto finish = [&](bool status) {
+        if (timing != nullptr) {
+            timing->send_ns += rpc_profile_now_ns() - start_ns;
+        }
+        return status;
+    };
     uint8_t cmd_byte = cmd;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
-        return false;
+        return finish(false);
     }
     if (!sock->send_data(&input_size, sizeof(input_size))) {
-        return false;
+        return finish(false);
     }
     if (!sock->send_data(input, input_size)) {
-        return false;
+        return finish(false);
     }
-    return sock->flush();
+    return finish(sock->flush());
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+static bool send_rpc_cmd(
+        socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size,
+        void * output, size_t output_size, rpc_call_timing * timing = nullptr) {
+    if (!send_rpc_cmd(sock, cmd, input, input_size, timing)) {
         return false;
     }
+    const uint64_t start_ns = timing != nullptr ? rpc_profile_now_ns() : 0;
+    const auto finish = [&](bool status) {
+        if (timing != nullptr) {
+            timing->recv_ns += rpc_profile_now_ns() - start_ns;
+        }
+        return status;
+    };
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
-        return false;
+        return finish(false);
     }
     if (out_size != output_size) {
-        return false;
+        return finish(false);
     }
     if (!sock->recv_data(output, output_size)) {
-        return false;
+        return finish(false);
     }
-    return true;
+    return finish(true);
 }
 
 // RPC client-side implementation
@@ -405,7 +769,7 @@ private:
 
 class rpc_dispatcher {
 public:
-    rpc_dispatcher() {
+    rpc_dispatcher() : profile("client") {
     }
 
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
@@ -418,6 +782,7 @@ public:
     void event_synchronize(ggml_backend_event_t event);
     void event_record(ggml_backend_event_t event);
     void synchronize();
+    void record_serialization(uint64_t time_ns, uint64_t bytes);
 
     void start(const std::string & endpoint);
     void work();
@@ -431,6 +796,7 @@ private:
         size_t                        input_size;
         void                        * output;
         size_t                        output_size;
+        uint64_t                      enqueue_ns;
         std::promise<void>            completion;
     };
     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
@@ -443,6 +809,7 @@ private:
     socket_ptr       sock;
     std::atomic_bool running;
     std::thread      thread;
+    rpc_profile_state profile;
 };
 
 static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
@@ -457,6 +824,7 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->input_size = input_size;
     msg->output = nullptr;
     msg->output_size = 0;
+    msg->enqueue_ns = profile.is_enabled() ? rpc_profile_now_ns() : 0;
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
     future.wait();
@@ -469,6 +837,7 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
     msg->input_size = input_size;
     msg->output = nullptr;
     msg->output_size = 0;
+    msg->enqueue_ns = profile.is_enabled() ? rpc_profile_now_ns() : 0;
     GGML_ASSERT(queue.push(msg));
 }
 
@@ -479,6 +848,7 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->input_size = input_size;
     msg->output = output;
     msg->output_size = output_size;
+    msg->enqueue_ns = profile.is_enabled() ? rpc_profile_now_ns() : 0;
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
     future.wait();
@@ -491,6 +861,7 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
     msg->input_size = input_size;
     msg->output = output;
     msg->output_size = output_size;
+    msg->enqueue_ns = profile.is_enabled() ? rpc_profile_now_ns() : 0;
     GGML_ASSERT(queue.push(msg));
 }
 
@@ -498,6 +869,7 @@ ggml_backend_event_t rpc_dispatcher::event_new(ggml_backend_dev_t dev) {
     rpc_event * ev = new rpc_event;
     ev->msg = std::make_shared<rpc_msg>();
     ev->msg->cmd = RPC_CMD_NONE;
+    ev->msg->enqueue_ns = 0;
     ev->sf = ev->msg->completion.get_future().share();
     GGML_ASSERT(queue.push(ev->msg));
     return new ggml_backend_event {
@@ -513,13 +885,18 @@ void rpc_dispatcher::event_free(ggml_backend_event_t event) {
 
 void rpc_dispatcher::event_synchronize(ggml_backend_event_t event) {
     rpc_event * ev = (rpc_event *)event->context;
+    const uint64_t start_ns = profile.is_enabled() ? rpc_profile_now_ns() : 0;
     ev->sf.wait();
+    if (profile.is_enabled()) {
+        profile.record_sync_wait(true, rpc_profile_now_ns() - start_ns);
+    }
 }
 
 void rpc_dispatcher::event_record(ggml_backend_event_t event) {
     rpc_event * ev = (rpc_event *)event->context;
     ev->msg = std::make_shared<rpc_msg>();
     ev->msg->cmd = RPC_CMD_NONE;
+    ev->msg->enqueue_ns = 0;
     ev->sf = ev->msg->completion.get_future().share();
     GGML_ASSERT(queue.push(ev->msg));
 }
@@ -528,8 +905,13 @@ void rpc_dispatcher::synchronize() {
     // to ensure all messages are processed, submit dummy message and wait for it to complete
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = RPC_CMD_NONE;
+    msg->enqueue_ns = 0;
     GGML_ASSERT(queue.push(msg));
+    const uint64_t start_ns = profile.is_enabled() ? rpc_profile_now_ns() : 0;
     msg->completion.get_future().wait();
+    if (profile.is_enabled()) {
+        profile.record_sync_wait(false, rpc_profile_now_ns() - start_ns);
+    }
 }
 
 void rpc_dispatcher::start(const std::string & endpoint) {
@@ -549,6 +931,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     if (!negotiate_hello(sock)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
     }
+    profile.set_endpoint(endpoint);
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     running = true;
     thread = std::thread(rpc_dispatcher_trampoline, this);
@@ -561,25 +944,43 @@ void rpc_dispatcher::work() {
             break;
         }
         if (msg_ptr->cmd != RPC_CMD_NONE) {
+            const uint64_t start_ns = profile.is_enabled() ? rpc_profile_now_ns() : 0;
+            rpc_call_timing timing;
             if (msg_ptr->output) {
-                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
+                bool status = send_rpc_cmd(
+                    sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size,
+                    msg_ptr->output, msg_ptr->output_size, profile.is_enabled() ? &timing : nullptr);
                 RPC_STATUS_ASSERT(status);
             } else {
-                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
+                bool status = send_rpc_cmd(
+                    sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size,
+                    profile.is_enabled() ? &timing : nullptr);
                 RPC_STATUS_ASSERT(status);
+            }
+            if (profile.is_enabled()) {
+                const uint64_t end_ns = rpc_profile_now_ns();
+                profile.record_client(
+                    msg_ptr->cmd, msg_ptr->input_size, msg_ptr->output_size,
+                    start_ns - msg_ptr->enqueue_ns, timing, end_ns - msg_ptr->enqueue_ns);
+                profile.maybe_report(sock);
             }
         }
         msg_ptr->completion.set_value();
     }
 }
 
+void rpc_dispatcher::record_serialization(uint64_t time_ns, uint64_t bytes) {
+    profile.add_serialization(time_ns, bytes);
+}
+
 rpc_dispatcher::~rpc_dispatcher() {
     running = false;
     queue.interrupt();
-    sock = nullptr;
     if (thread.joinable()) {
         thread.join();
     }
+    profile.report(sock, "final");
+    sock = nullptr;
 }
 
 static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoint) {
@@ -736,7 +1137,11 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         cache_flag = 1;
     }
     size_t input_size;
+    const uint64_t serialize_start_ns = rpc_profile_enabled() ? rpc_profile_now_ns() : 0;
     auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
+    if (rpc_profile_enabled()) {
+        ctx->dispatcher->record_serialization(rpc_profile_now_ns() - serialize_start_ns, input_size);
+    }
     ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
 }
 
@@ -962,7 +1367,11 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
         cache_flag = 1;
     }
     size_t input_size;
+    const uint64_t serialize_start_ns = rpc_profile_enabled() ? rpc_profile_now_ns() : 0;
     auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
+    if (rpc_profile_enabled()) {
+        ctx->dispatcher->record_serialization(rpc_profile_now_ns() - serialize_start_ns, input_size);
+    }
     ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input, input_size);
 }
 
@@ -1042,7 +1451,11 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     } else {
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         size_t input_size = 0;
+        const uint64_t serialize_start_ns = rpc_profile_enabled() ? rpc_profile_now_ns() : 0;
         uint8_t * input = serialize_graph(rpc_ctx->device, cgraph, rpc_ctx->dispatcher, &input_size);
+        if (rpc_profile_enabled()) {
+            rpc_ctx->dispatcher->record_serialization(rpc_profile_now_ns() - serialize_start_ns, input_size);
+        }
         std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
         rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
     }
@@ -1145,9 +1558,10 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 
 class rpc_server {
 public:
-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
+    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, socket_ptr profile_sock, const char * endpoint)
+        : backends(std::move(all_backends)), cache_dir(cache_dir), profile_sock(std::move(profile_sock)), profile("server") {
         stored_graphs.resize(backends.size());
+        profile.set_endpoint(endpoint);
     }
     ~rpc_server();
 
@@ -1168,6 +1582,10 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
+    void profile_record_command(enum rpc_cmd cmd, uint64_t dispatch_ns) {
+        profile.record_server(cmd, dispatch_ns);
+        profile.maybe_report(profile_sock);
+    }
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -1188,6 +1606,8 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+    socket_ptr profile_sock;
+    rpc_profile_state profile;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1369,6 +1789,7 @@ bool rpc_server::memset_tensor(const rpc_msg_memset_tensor_req & request) {
 }
 
 ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor) {
+    rpc_profile_deserialize_timer timer(profile);
     // Validate tensor type before using it
     if (tensor->type >= GGML_TYPE_COUNT) {
         GGML_LOG_ERROR("[%s] invalid tensor type received: %u\n", __func__, tensor->type);
@@ -1778,7 +2199,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
         }
     }
+    const uint64_t graph_start_ns = rpc_profile_enabled() ? rpc_profile_now_ns() : 0;
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    if (rpc_profile_enabled()) {
+        profile.record_remote_graph(RPC_CMD_GRAPH_COMPUTE, rpc_profile_now_ns() - graph_start_ns);
+    }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     stored_graphs[device].graph = graph;
     return true;
@@ -1794,7 +2219,11 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
+    const uint64_t graph_start_ns = rpc_profile_enabled() ? rpc_profile_now_ns() : 0;
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    if (rpc_profile_enabled()) {
+        profile.record_remote_graph(RPC_CMD_GRAPH_RECOMPUTE, rpc_profile_now_ns() - graph_start_ns);
+    }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     return true;
 }
@@ -1814,14 +2243,15 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    profile.report(profile_sock, "final");
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
 }
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             socket_ptr sock) {
-    rpc_server server(backends, cache_dir);
+                             socket_ptr sock, const char * endpoint) {
+    rpc_server server(backends, cache_dir, sock, endpoint);
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -1867,6 +2297,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
+        const uint64_t dispatch_start_ns = rpc_profile_enabled() ? rpc_profile_now_ns() : 0;
         switch (cmd) {
             case RPC_CMD_HELLO: {
                 // HELLO command is handled above
@@ -2084,6 +2515,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 return;
             }
         }
+        if (rpc_profile_enabled()) {
+            server.profile_record_command((enum rpc_cmd) cmd, rpc_profile_now_ns() - dispatch_start_ns);
+        }
     }
 }
 
@@ -2150,7 +2584,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
         printf("Accepted client connection\n");
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket);
+        rpc_serve_client(backends, cache_dir, client_socket, endpoint);
         printf("Client connection closed\n");
         fflush(stdout);
     }

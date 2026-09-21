@@ -118,3 +118,13 @@ Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `ggm
 $ GGML_RPC_DEBUG=1 bin/ggml-rpc-server
 ```
 
+Set `GGML_RPC_PROFILE=1` on both the client and server to print aggregate RPC timing and traffic statistics. Reports include per-command counts and payload bytes, client queue/send/response-wait time, scheduler synchronization waits, transport calls and bytes, serialization time, and server graph execution time. Latency reports include the exact maximum and a p95 calculated from the most recent 4096 samples.
+
+By default, cumulative statistics are printed only when the connection closes. Set `GGML_RPC_PROFILE_INTERVAL` to a graph count to request periodic snapshots:
+
+```bash
+$ GGML_RPC_PROFILE=1 GGML_RPC_PROFILE_INTERVAL=128 bin/ggml-rpc-server
+```
+
+Periodic snapshots are written synchronously and can perturb latency, so final-only reporting is preferred for performance measurements. All profiler lines begin with `rpc_profile`. Transport `recv_block_ms` includes time blocked waiting for bytes; on an idle server this includes time waiting for the next client command. Client graph commands are asynchronous, so their client-side total ends when the command is sent. Use the server's `remote_graph_ms` and the client's synchronization-wait fields to measure graph execution and its visible stall separately.
+

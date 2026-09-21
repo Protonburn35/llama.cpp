@@ -10,6 +10,15 @@ typedef std::shared_ptr<socket_t> socket_ptr;
 static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
 static constexpr size_t RPC_CONN_CAPS_SIZE = 24;
 
+struct rpc_transport_stats {
+    uint64_t send_calls;
+    uint64_t recv_calls;
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
+    uint64_t send_time_ns;
+    uint64_t recv_time_ns;
+};
+
 struct socket_t {
     ~socket_t();
 
@@ -24,6 +33,7 @@ struct socket_t {
 
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
+    rpc_transport_stats get_stats() const;
 
     static socket_ptr create_server(const char * host, int port);
     static socket_ptr connect(const char * host, int port);

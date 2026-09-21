@@ -17,6 +17,7 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -45,6 +46,19 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
+
+static bool rpc_profile_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("GGML_RPC_PROFILE");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+static uint64_t rpc_profile_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 #ifdef GGML_RPC_RDMA
 static constexpr size_t RDMA_GID_SIZE = 16;            // RoCE GID / IB GID is always 16 bytes
@@ -122,13 +136,14 @@ static_assert(sizeof(rdma_caps) == RPC_CONN_CAPS_SIZE, "rdma_caps must match con
 #endif // GGML_RPC_RDMA && !GGML_RPC_RDMA_APPLE
 
 struct socket_t::impl {
-    impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
+    impl(sockfd_t fd) : use_rdma(false), fd(fd), profile_enabled(rpc_profile_enabled()) {}
     ~impl();
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
     bool flush();
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
+    rpc_transport_stats get_stats() const;
 
 #ifdef GGML_RPC_RDMA
     std::optional<rdma_gid_t> rdma_build_target_gid();
@@ -149,6 +164,8 @@ struct socket_t::impl {
 #endif // GGML_RPC_RDMA
     bool     use_rdma;
     sockfd_t fd;
+    bool     profile_enabled;
+    rpc_transport_stats stats = {};
 };
 
 socket_t::impl::~impl() {
@@ -478,55 +495,109 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
 #endif // GGML_RPC_RDMA
 
 bool socket_t::impl::send_data(const void * data, size_t size) {
+    const uint64_t start_ns = profile_enabled ? rpc_profile_now_ns() : 0;
+    const auto finish = [&](bool status) {
+        if (profile_enabled) {
+            stats.send_time_ns += rpc_profile_now_ns() - start_ns;
+        }
+        return status;
+    };
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
-        return rdma->send(data, size);
+        if (profile_enabled) {
+            stats.send_calls++;
+        }
+        const bool status = rdma->send(data, size);
+        if (status && profile_enabled) {
+            stats.bytes_sent += size;
+        }
+        return finish(status);
     }
 #elif defined(GGML_RPC_RDMA)
     if (use_rdma) {
-        return rdma_send(data, size);
+        if (profile_enabled) {
+            stats.send_calls++;
+        }
+        const bool status = rdma_send(data, size);
+        if (status && profile_enabled) {
+            stats.bytes_sent += size;
+        }
+        return finish(status);
     }
 #endif
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
+        if (profile_enabled) {
+            stats.send_calls++;
+        }
         ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
         if (n < 0) {
             GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
                            bytes_sent, size_to_send);
-            return false;
+            return finish(false);
+        }
+        if (profile_enabled) {
+            stats.bytes_sent += (size_t)n;
         }
         bytes_sent += (size_t)n;
     }
-    return true;
+    return finish(true);
 }
 
 bool socket_t::impl::recv_data(void * data, size_t size) {
+    const uint64_t start_ns = profile_enabled ? rpc_profile_now_ns() : 0;
+    const auto finish = [&](bool status) {
+        if (profile_enabled) {
+            stats.recv_time_ns += rpc_profile_now_ns() - start_ns;
+        }
+        return status;
+    };
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
-        return rdma->recv(data, size);
+        if (profile_enabled) {
+            stats.recv_calls++;
+        }
+        const bool status = rdma->recv(data, size);
+        if (status && profile_enabled) {
+            stats.bytes_received += size;
+        }
+        return finish(status);
     }
 #elif defined(GGML_RPC_RDMA)
     if (use_rdma) {
-        return rdma_recv(data, size);
+        if (profile_enabled) {
+            stats.recv_calls++;
+        }
+        const bool status = rdma_recv(data, size);
+        if (status && profile_enabled) {
+            stats.bytes_received += size;
+        }
+        return finish(status);
     }
 #endif
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
+        if (profile_enabled) {
+            stats.recv_calls++;
+        }
         ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);
         if (n < 0) {
             GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
                            bytes_recv, size_to_recv);
-            return false;
+            return finish(false);
         }
         if (n == 0) {
             LOG_DBG("recv returned 0 (peer closed?)\n");
-            return false;
+            return finish(false);
+        }
+        if (profile_enabled) {
+            stats.bytes_received += (size_t)n;
         }
         bytes_recv += (size_t)n;
     }
-    return true;
+    return finish(true);
 }
 
 void socket_t::impl::get_caps(uint8_t * local_caps) {
@@ -585,6 +656,10 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
 #endif // GGML_RPC_RDMA
 }
 
+rpc_transport_stats socket_t::impl::get_stats() const {
+    return stats;
+}
+
 bool socket_t::impl::flush() {
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
@@ -618,6 +693,10 @@ void socket_t::get_caps(uint8_t * local_caps) {
 
 void socket_t::update_caps(const uint8_t * remote_caps) {
     return pimpl->update_caps(remote_caps);
+}
+
+rpc_transport_stats socket_t::get_stats() const {
+    return pimpl->get_stats();
 }
 
 static bool is_valid_fd(sockfd_t sockfd) {
