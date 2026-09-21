@@ -28,6 +28,8 @@ struct socket_t {
     // writes into fixed-size frames and posts the trailing partial frame only
     // here. No-op on TCP.
     bool flush();
+    // Whether adjacent writes may be consumed through arbitrary read sizes.
+    bool is_byte_stream() const;
 
     socket_ptr accept();
 

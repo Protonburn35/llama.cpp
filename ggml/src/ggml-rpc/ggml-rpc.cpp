@@ -88,6 +88,10 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
+static constexpr size_t RPC_WIRE_SIZE_SIZE   = sizeof(uint64_t);
+static constexpr size_t RPC_WIRE_CMD_SIZE    = sizeof(uint8_t);
+static constexpr size_t RPC_WIRE_HEADER_SIZE = RPC_WIRE_CMD_SIZE + RPC_WIRE_SIZE_SIZE;
+static constexpr size_t RPC_COALESCE_MAX     = 4096;
 
 static bool rpc_profile_enabled() {
     static const bool enabled = []() {
@@ -602,11 +606,23 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf
 }
 
 static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
-    if (!sock->send_data(&msg_size, sizeof(msg_size))) {
-        return false;
-    }
-    if (!sock->send_data(msg, msg_size)) {
-        return false;
+    const uint64_t wire_size = msg_size;
+    if (sock->is_byte_stream() && msg_size <= RPC_COALESCE_MAX) {
+        std::array<uint8_t, RPC_WIRE_SIZE_SIZE + RPC_COALESCE_MAX> frame;
+        memcpy(frame.data(), &wire_size, RPC_WIRE_SIZE_SIZE);
+        if (msg_size > 0) {
+            memcpy(frame.data() + RPC_WIRE_SIZE_SIZE, msg, msg_size);
+        }
+        if (!sock->send_data(frame.data(), RPC_WIRE_SIZE_SIZE + msg_size)) {
+            return false;
+        }
+    } else {
+        if (!sock->send_data(&wire_size, RPC_WIRE_SIZE_SIZE)) {
+            return false;
+        }
+        if (!sock->send_data(msg, msg_size)) {
+            return false;
+        }
     }
     return sock->flush();
 }
@@ -662,15 +678,36 @@ static bool send_rpc_cmd(
         }
         return status;
     };
-    uint8_t cmd_byte = cmd;
-    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
-        return finish(false);
-    }
-    if (!sock->send_data(&input_size, sizeof(input_size))) {
-        return finish(false);
-    }
-    if (!sock->send_data(input, input_size)) {
-        return finish(false);
+    std::array<uint8_t, RPC_WIRE_HEADER_SIZE + RPC_COALESCE_MAX> frame;
+    frame[0] = static_cast<uint8_t>(cmd);
+    const uint64_t wire_input_size = input_size;
+    memcpy(frame.data() + RPC_WIRE_CMD_SIZE, &wire_input_size, RPC_WIRE_SIZE_SIZE);
+    if (sock->is_byte_stream()) {
+        if (input_size <= RPC_COALESCE_MAX) {
+            if (input_size > 0) {
+                memcpy(frame.data() + RPC_WIRE_HEADER_SIZE, input, input_size);
+            }
+            if (!sock->send_data(frame.data(), RPC_WIRE_HEADER_SIZE + input_size)) {
+                return finish(false);
+            }
+        } else {
+            if (!sock->send_data(frame.data(), RPC_WIRE_HEADER_SIZE)) {
+                return finish(false);
+            }
+            if (!sock->send_data(input, input_size)) {
+                return finish(false);
+            }
+        }
+    } else {
+        if (!sock->send_data(frame.data(), RPC_WIRE_CMD_SIZE)) {
+            return finish(false);
+        }
+        if (!sock->send_data(frame.data() + RPC_WIRE_CMD_SIZE, RPC_WIRE_SIZE_SIZE)) {
+            return finish(false);
+        }
+        if (!sock->send_data(input, input_size)) {
+            return finish(false);
+        }
     }
     return finish(sock->flush());
 }
