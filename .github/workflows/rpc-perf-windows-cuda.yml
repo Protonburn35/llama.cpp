@@ -1,0 +1,189 @@
+name: RPC perf (Windows CUDA 13.4)
+
+on:
+  push:
+    branches:
+      - rpc-perf/profile-coalesce-b324
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rpc-perf-windows-cuda-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x64 / CUDA 13.4 / sm_89 + sm_120a
+    runs-on: windows-2022
+    timeout-minutes: 240
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Install CUDA 13.4
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: "13.4"
+          cuda_arch: x64
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja -y --no-progress
+
+      - name: Configure and build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DBUILD_SHARED_LIBS=ON ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=OFF ^
+            -DGGML_CUDA=ON ^
+            -DGGML_RPC=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="89-real;120a-real" ^
+            -DLLAMA_BUILD_APP=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_UI=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          if %NINJA_JOBS% LSS 1 set NINJA_JOBS=1
+          cmake --build build --config Release -j %NINJA_JOBS% --target llama-server ggml-rpc-server ggml-cpu ggml-cuda ggml-rpc
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $shortSha = (git rev-parse --short=12 HEAD).Trim()
+          $artifactName = "llama-rpc-perf-win-cuda-13.4-sm89-sm120a-$shortSha"
+          $stage = Join-Path $env:RUNNER_TEMP $artifactName
+          $bin = Join-Path (Get-Location).Path "build\bin\Release"
+
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+          foreach ($name in @("llama-server.exe", "ggml-rpc-server.exe")) {
+            $source = Join-Path $bin $name
+            if (-not (Test-Path -LiteralPath $source)) {
+              throw "Missing required executable: $source"
+            }
+            Copy-Item -LiteralPath $source -Destination $stage
+          }
+
+          $builtDlls = @(Get-ChildItem -LiteralPath $bin -Filter "*.dll" -File)
+          if ($builtDlls.Count -eq 0) {
+            throw "No build DLLs found in $bin"
+          }
+          foreach ($dll in $builtDlls) {
+            Copy-Item -LiteralPath $dll.FullName -Destination $stage
+          }
+
+          foreach ($name in @(
+            "ggml.dll",
+            "ggml-base.dll",
+            "ggml-cpu.dll",
+            "ggml-cuda.dll",
+            "ggml-rpc.dll",
+            "llama.dll"
+          )) {
+            if (-not (Test-Path -LiteralPath (Join-Path $stage $name))) {
+              throw "Missing required build DLL: $name"
+            }
+          }
+
+          $cudaDirs = @(
+            (Join-Path $env:CUDA_PATH "bin"),
+            (Join-Path $env:CUDA_PATH "bin\x64"),
+            (Join-Path $env:CUDA_PATH "lib")
+          ) | Where-Object { Test-Path -LiteralPath $_ }
+
+          foreach ($pattern in @(
+            "cudart64_*.dll",
+            "cublas64_*.dll",
+            "cublasLt64_*.dll"
+          )) {
+            $cudaDll = $null
+            foreach ($dir in $cudaDirs) {
+              $cudaDll = Get-ChildItem -LiteralPath $dir -Filter $pattern -File |
+                Select-Object -First 1
+              if ($null -ne $cudaDll) {
+                break
+              }
+            }
+
+            if ($null -eq $cudaDll) {
+              throw "Unable to find CUDA runtime DLL matching $pattern"
+            }
+            Copy-Item -LiteralPath $cudaDll.FullName -Destination $stage -Force
+          }
+
+          Copy-Item -LiteralPath "LICENSE" -Destination $stage
+
+          $payload = @(
+            Get-ChildItem -LiteralPath $stage -File |
+              Sort-Object Name |
+              ForEach-Object {
+                [ordered]@{
+                  name   = $_.Name
+                  bytes  = $_.Length
+                  sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                }
+              }
+          )
+
+          $nvccVersion = (
+            & (Join-Path $env:CUDA_PATH "bin\nvcc.exe") --version |
+              Select-Object -Last 1
+          ).Trim()
+
+          $manifest = [ordered]@{
+            schemaVersion     = 1
+            createdUtc        = (Get-Date).ToUniversalTime().ToString("o")
+            sourceRepository  = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY"
+            sourceRef         = $env:GITHUB_REF_NAME
+            sourceCommit      = (git rev-parse HEAD).Trim()
+            workflowRun       = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            runner            = "windows-2022"
+            configuration     = "Release"
+            generator         = "Ninja Multi-Config"
+            cudaToolkit       = $nvccVersion
+            cudaArchitectures = @("89-real", "120a-real")
+            cmake             = (cmake --version | Select-Object -First 1).Trim()
+            payloadFiles      = $payload
+          }
+
+          $manifest |
+            ConvertTo-Json -Depth 6 |
+            Set-Content -LiteralPath (Join-Path $stage "BUILD-MANIFEST.json") -Encoding utf8
+
+          $zipName = "$artifactName.zip"
+          $zipPath = Join-Path (Get-Location).Path $zipName
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zipPath -CompressionLevel Optimal
+
+          $zipSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "Archive: $zipName"
+          Write-Host "SHA256:  $zipSha256"
+
+          "artifact_name=$artifactName" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "zip_path=$zipName" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "zip_sha256=$zipSha256" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.zip_path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
