@@ -82,7 +82,7 @@ jobs:
       - name: Configure Release CUDA build with CMake
         shell: pwsh
         run: |
-          cmake -S . -B build -G 'Visual Studio 18 2026' -A x64 -DCMAKE_GENERATOR_INSTANCE="$env:VS_INSTALLATION_PATH" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$env:CUDA_ARCHS" -DGGML_CUDA=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TOOLS=ON
+          cmake -S . -B build -G 'Visual Studio 18 2026' -A x64 -DCMAKE_GENERATOR_INSTANCE="$env:VS_INSTALLATION_PATH" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$env:CUDA_ARCHS" -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TOOLS=ON
           if ($LASTEXITCODE -ne 0) {
             throw 'CMake configuration failed'
           }
@@ -149,6 +149,7 @@ jobs:
           CMake architecture: x64
           CMake configuration: Release
           GGML_CUDA: ON
+          BUILD_SHARED_LIBS: OFF
           CMAKE_CUDA_ARCHITECTURES: $env:CUDA_ARCHS
           CUDA architecture probe: $env:CUDA_ARCH_PROBE
           Build target: llama-server
