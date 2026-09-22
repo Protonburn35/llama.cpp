@@ -49,12 +49,14 @@ static size_t rpc_graph_cache_capacity_from_wire(uint64_t entries) {
 }
 
 enum rpc_feature : uint64_t {
-    RPC_FEATURE_MULTI_GRAPH_CACHE = UINT64_C(1) << 0,
-    RPC_FEATURE_REMOTE_MOE_CACHE  = UINT64_C(1) << 1,
+    RPC_FEATURE_MULTI_GRAPH_CACHE          = UINT64_C(1) << 0,
+    RPC_FEATURE_REMOTE_MOE_CACHE           = UINT64_C(1) << 1,
+    RPC_FEATURE_GRAPH_EXECUTION_CERTIFICATE = UINT64_C(1) << 2,
 };
 
 static constexpr uint64_t RPC_FEATURES =
-    RPC_FEATURE_MULTI_GRAPH_CACHE | RPC_FEATURE_REMOTE_MOE_CACHE;
+    RPC_FEATURE_MULTI_GRAPH_CACHE | RPC_FEATURE_REMOTE_MOE_CACHE |
+    RPC_FEATURE_GRAPH_EXECUTION_CERTIFICATE;
 
 enum rpc_buffer_kind : uint32_t {
     RPC_BUFFER_KIND_DEFAULT   = 0,
@@ -660,6 +662,14 @@ struct rpc_msg_graph_compute_header {
     uint64_t graph_uid;
     uint64_t graph_cache_size;
 };
+
+struct rpc_msg_graph_compute_header_with_certificate {
+    rpc_msg_graph_compute_header base;
+    ggml_graph_execution_certificate execution_certificate;
+};
+
+static_assert(sizeof(rpc_msg_graph_compute_header_with_certificate) ==
+              sizeof(rpc_msg_graph_compute_header) + sizeof(ggml_graph_execution_certificate));
 
 struct rpc_msg_moe_snapshot_header {
     uint32_t device;
@@ -1726,10 +1736,13 @@ static uint8_t * serialize_graph(
     for (uint32_t i = 0; i < n_nodes; i++) {
         add_tensor(cgraph->nodes[i], cgraph, dispatcher, tensors, visited);
     }
+    const bool send_certificate = dispatcher->supports(RPC_FEATURE_GRAPH_EXECUTION_CERTIFICATE);
+    const size_t header_size = send_certificate ?
+        sizeof(rpc_msg_graph_compute_header_with_certificate) : sizeof(rpc_msg_graph_compute_header);
     // serialization format:
     // | header | nodes (n_nodes * sizeof(uint64_t)) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     uint32_t n_tensors = tensors.size();
-    *output_size = sizeof(rpc_msg_graph_compute_header) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
+    *output_size = header_size + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
     uint8_t * output = new uint8_t[*output_size]();
     uint8_t * dest = output;
     const rpc_msg_graph_compute_header header = {
@@ -1740,6 +1753,10 @@ static uint8_t * serialize_graph(
     };
     memcpy(dest, &header, sizeof(header));
     dest += sizeof(header);
+    if (send_certificate) {
+        memcpy(dest, &cgraph->execution_certificate, sizeof(cgraph->execution_certificate));
+        dest += sizeof(cgraph->execution_certificate);
+    }
     for (uint32_t i = 0; i < n_nodes; i++) {
         memcpy(dest + i * sizeof(uint64_t), &cgraph->nodes[i], sizeof(uint64_t));
     }
@@ -2113,6 +2130,9 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool moe_snapshot(enum rpc_cmd cmd, const std::vector<uint8_t> & input, rpc_msg_moe_snapshot_rsp & response);
     void set_moe_debug(bool enabled);
+    void set_peer_features(uint64_t features) {
+        peer_features = features & RPC_FEATURES;
+    }
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     void profile_record_command(enum rpc_cmd cmd, uint64_t dispatch_ns) {
@@ -2179,6 +2199,7 @@ private:
     std::vector<server_cache_type> cache_types;
     // Stores the most recently used serialized graphs for each backend.
     std::vector<stored_graph_cache> stored_graphs;
+    uint64_t peer_features = 0;
     socket_ptr profile_sock;
     rpc_profile_state profile;
 };
@@ -2955,19 +2976,27 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     // serialization format:
     // | header | nodes (n_nodes * sizeof(uint64_t)) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
-    if (input.size() < sizeof(rpc_msg_graph_compute_header) + sizeof(uint32_t)) {
+    const bool has_certificate = (peer_features & RPC_FEATURE_GRAPH_EXECUTION_CERTIFICATE) != 0;
+    const size_t header_size = has_certificate ?
+        sizeof(rpc_msg_graph_compute_header_with_certificate) : sizeof(rpc_msg_graph_compute_header);
+    if (input.size() < header_size + sizeof(uint32_t)) {
         return false;
     }
     const uint8_t * src = input.data();
     rpc_msg_graph_compute_header header;
     memcpy(&header, src, sizeof(header));
     src += sizeof(header);
+    ggml_graph_execution_certificate execution_certificate = {};
+    if (has_certificate) {
+        memcpy(&execution_certificate, src, sizeof(execution_certificate));
+        src += sizeof(execution_certificate);
+    }
     const uint32_t device = header.device;
     if (device >= backends.size()) {
         return false;
     }
     const uint32_t n_nodes = header.n_nodes;
-    const size_t header_and_count_size = sizeof(header) + sizeof(uint32_t);
+    const size_t header_and_count_size = header_size + sizeof(uint32_t);
     if (n_nodes > (input.size() - header_and_count_size)/sizeof(uint64_t)) {
         return false;
     }
@@ -3032,6 +3061,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     ggml_context * ctx = ctx_ptr.get();
     struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_nodes, false);
     graph->n_nodes = n_nodes;
+    graph->uid = header.graph_uid;
+    if (has_certificate) {
+        graph->execution_certificate = execution_certificate;
+    }
     std::unordered_map<uint64_t, const rpc_tensor*> tensor_ptrs;
     tensor_ptrs.reserve(n_tensors);
     for (uint32_t i = 0; i < n_tensors; i++) {
@@ -3211,6 +3244,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     if (!sock->recv_data(&req, sizeof(req))) {
         return;
     }
+
+    server.set_peer_features(req.features);
 
     rpc_msg_hello_rsp rsp = {};
     server.hello(rsp);
