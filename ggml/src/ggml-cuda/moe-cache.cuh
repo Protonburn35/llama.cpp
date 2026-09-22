@@ -1071,6 +1071,8 @@ struct ggml_cuda_moe_cache;
 
 ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void);
 ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_bounded_buffer_type(size_t bytes);
+ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type_for_device(
+    ggml_backend_dev_t device, size_t host_limit);
 void ggml_backend_cuda_moe_cached_free_buffer_type(ggml_backend_buffer_type_t buft);
 bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t buft, const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
 bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft);

@@ -455,22 +455,54 @@ ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(ggml_bac
         return nullptr;
     }
 
-    buffer->buft = ggml_backend_cuda_moe_cached_buffer_type();
+    buffer->buft = buft;
     return buffer;
 }
 
 extern "C"
 ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_bounded_buffer_type(size_t bytes) {
-    if (bytes == 0) {
-        return ggml_backend_cuda_moe_cached_buffer_type();
-    }
-    auto * owner = new (std::nothrow) moe_host_budget(bytes);
-    if (owner == nullptr) {
+    return ggml_backend_cuda_moe_cached_buffer_type_for_device(
+        ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0), bytes);
+}
+
+extern "C"
+ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type_for_device(
+        ggml_backend_dev_t device, size_t host_limit) {
+    if (device == nullptr || ggml_backend_dev_backend_reg(device) != ggml_backend_cuda_reg()) {
         return nullptr;
     }
-    owner->type = *ggml_backend_cuda_moe_cached_buffer_type();
-    owner->type.context = owner;
-    return &owner->type;
+
+    ggml_backend_buffer_type_t base = ggml_backend_cuda_moe_cached_buffer_type();
+    if (host_limit != 0) {
+        auto * owner = new (std::nothrow) moe_host_budget(host_limit);
+        if (owner == nullptr) {
+            return nullptr;
+        }
+        owner->type = *base;
+        owner->type.device = device;
+        owner->type.context = owner;
+        return &owner->type;
+    }
+
+    if (base->device == device) {
+        return base;
+    }
+
+    // Device-specific unbounded types are process-lifetime registry objects,
+    // matching the lifetime of CUDA's ordinary buffer types.
+    static std::mutex mutex;
+    static std::unordered_map<ggml_backend_dev_t, std::unique_ptr<ggml_backend_buffer_type>> types;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto & result = types[device];
+    if (!result) {
+        result.reset(new (std::nothrow) ggml_backend_buffer_type(*base));
+        if (!result) {
+            return nullptr;
+        }
+        result->device = device;
+        result->context = nullptr;
+    }
+    return result.get();
 }
 
 extern "C"

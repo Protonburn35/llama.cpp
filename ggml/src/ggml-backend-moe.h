@@ -10,6 +10,7 @@ extern "C" {
 
 #define GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_buffer_type"
 #define GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_bounded_buffer_type"
+#define GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_FOR_DEVICE_PROC_NAME "ggml_backend_moe_cache_buffer_type_for_device"
 #define GGML_BACKEND_MOE_CACHE_FREE_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_free_buffer_type"
 #define GGML_BACKEND_MOE_CACHE_CONFIGURE_SOURCES_PROC_NAME "ggml_backend_moe_cache_configure_sources"
 #define GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_is_buffer_type"
@@ -20,6 +21,10 @@ extern "C" {
 
 typedef ggml_backend_buffer_type_t (*ggml_backend_moe_cache_buffer_type_t)(void);
 typedef ggml_backend_buffer_type_t (*ggml_backend_moe_cache_bounded_buffer_type_t)(size_t bytes);
+// Returns a cache-source buffer type whose execution owner is `device`.
+// `host_limit == 0` requests the legacy fully pinned source allocation.
+typedef ggml_backend_buffer_type_t (*ggml_backend_moe_cache_buffer_type_for_device_t)(
+    ggml_backend_dev_t device, size_t host_limit);
 typedef void (*ggml_backend_moe_cache_free_buffer_type_t)(ggml_backend_buffer_type_t buft);
 typedef bool (*ggml_backend_moe_cache_is_buffer_type_t)(ggml_backend_buffer_type_t buft);
 typedef ggml_backend_buffer_t (*ggml_backend_moe_cache_buffer_from_host_ptr_t)(ggml_backend_buffer_type_t buft, void * ptr, size_t size);
@@ -190,6 +195,9 @@ struct ggml_backend_moe_candidate_snapshot_v2 {
 typedef int32_t (*ggml_backend_moe_candidate_replace_v2_t)(ggml_backend_t backend, const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
 typedef bool (*ggml_backend_moe_cache_configure_sources_t)(ggml_backend_buffer_type_t buft, const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
 typedef bool (*ggml_backend_required_grouped_execution_supported_t)(ggml_backend_t backend);
+
+#define GGML_BACKEND_RPC_SET_GRAPH_CACHE_SIZE_PROC_NAME "ggml_backend_rpc_set_graph_cache_size"
+typedef void (*ggml_backend_rpc_set_graph_cache_size_t)(size_t entries);
 
 #ifdef __cplusplus
 }

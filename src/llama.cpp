@@ -339,7 +339,11 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (params.moe_expert_cache_host_pinned_size > 0 && params.moe_expert_cache_slots <= 0) {
             throw std::runtime_error("--moe-expert-cache-host-pinned-mb requires --moe-expert-cache-size");
         }
-        if (params.moe_expert_cache_slots > 0) {
+        // The opt-in distributed path selects an owner-specific source type
+        // after layer placement is known.  Keeping this legacy override only
+        // on the OFF path makes the baseline byte-for-byte equivalent in its
+        // buffer-selection behavior.
+        if (params.moe_expert_cache_slots > 0 && !params.rpc_moe_cache_remote) {
             ggml_backend_moe_cache_buffer_type_t buffer_type_fn = nullptr;
             ggml_backend_reg_t cache_reg = nullptr;
             for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {

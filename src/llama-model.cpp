@@ -39,6 +39,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -1191,6 +1192,42 @@ struct llama_model::impl {
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
 
+    struct moe_buft_owner {
+        ggml_backend_buffer_type_t type = nullptr;
+        ggml_backend_moe_cache_free_buffer_type_t release = nullptr;
+
+        moe_buft_owner() = default;
+        moe_buft_owner(ggml_backend_buffer_type_t type, ggml_backend_moe_cache_free_buffer_type_t release)
+            : type(type), release(release) {}
+        moe_buft_owner(const moe_buft_owner &) = delete;
+        moe_buft_owner & operator=(const moe_buft_owner &) = delete;
+        moe_buft_owner(moe_buft_owner && other) noexcept
+            : type(other.type), release(other.release) {
+            other.type = nullptr;
+        }
+        moe_buft_owner & operator=(moe_buft_owner && other) noexcept {
+            if (this != &other) {
+                if (type != nullptr && release != nullptr) {
+                    release(type);
+                }
+                type = other.type;
+                release = other.release;
+                other.type = nullptr;
+            }
+            return *this;
+        }
+        ~moe_buft_owner() {
+            if (type != nullptr && release != nullptr) {
+                release(type);
+            }
+        }
+    };
+
+    // Declared before ctxs_bufs so cache buffer types outlive every buffer
+    // allocated from them (members are destroyed in reverse order).
+    std::vector<moe_buft_owner> moe_buft_owners;
+    std::map<ggml_backend_dev_t, ggml_backend_buffer_type_t> moe_buft_by_device;
+
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
     std::vector<llama_moe_source_group> moe_sources;
@@ -1550,6 +1587,41 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
+    if (params.moe_expert_cache_slots > 0 && params.rpc_moe_cache_remote) {
+        std::unordered_set<ggml_backend_dev_t> cache_devices;
+        for (const auto & layer : pimpl->dev_layer) {
+            if (ggml_backend_dev_type(layer.dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                cache_devices.insert(layer.dev);
+            }
+        }
+        for (auto * dev : cache_devices) {
+            auto * reg = ggml_backend_dev_backend_reg(dev);
+            auto create = reg != nullptr ? reinterpret_cast<ggml_backend_moe_cache_buffer_type_for_device_t>(
+                ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_FOR_DEVICE_PROC_NAME)) : nullptr;
+            auto release = reg != nullptr ? reinterpret_cast<ggml_backend_moe_cache_free_buffer_type_t>(
+                ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_FREE_BUFFER_TYPE_PROC_NAME)) : nullptr;
+            if (create == nullptr || release == nullptr) {
+                throw std::runtime_error(format(
+                    "--rpc-moe-cache-remote requires cache-source capability on device %s",
+                    ggml_backend_dev_name(dev)));
+            }
+            auto * buft = create(dev, params.moe_expert_cache_host_pinned_size);
+            if (buft == nullptr) {
+                throw std::runtime_error(format(
+                    "unable to create MoE cache source buffer for device %s",
+                    ggml_backend_dev_name(dev)));
+            }
+            pimpl->moe_buft_by_device.emplace(dev, buft);
+            pimpl->moe_buft_owners.emplace_back(buft, release);
+            LLAMA_LOG_INFO("moe-cache-device: owner=%s source_buft=%s slots=%d host_pin_limit=%zu\n",
+                ggml_backend_dev_name(dev), ggml_backend_buft_name(buft),
+                params.moe_expert_cache_slots, params.moe_expert_cache_host_pinned_size);
+        }
+        if (pimpl->moe_buft_by_device.empty()) {
+            throw std::runtime_error("--rpc-moe-cache-remote found no accelerator-owned expert layers");
+        }
+    }
+
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
     // create tensors for the weights
@@ -1783,13 +1855,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             (ggml_backend_moe_cache_is_buffer_type_t) ggml_backend_reg_get_proc_address(
                 buft_reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) : nullptr;
         const bool is_moe_cache_buft = is_moe_cache_buft_fn != nullptr && is_moe_cache_buft_fn(buft);
-        if (ml.use_mmap && use_mmap_buffer && is_moe_cache_buft) {
+        auto buffer_from_host_ptr_fn = buft_reg != nullptr ?
+            (ggml_backend_moe_cache_buffer_from_host_ptr_t) ggml_backend_reg_get_proc_address(
+                buft_reg, GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME) : nullptr;
+        if (ml.use_mmap && use_mmap_buffer && is_moe_cache_buft && buffer_from_host_ptr_fn != nullptr) {
             GGML_ASSERT(!ml.no_alloc);
-            auto buffer_from_host_ptr_fn = (ggml_backend_moe_cache_buffer_from_host_ptr_t)
-                    ggml_backend_reg_get_proc_address(buft_reg, GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME);
-            if (buffer_from_host_ptr_fn == nullptr) {
-                throw std::runtime_error(format("%s does not support buffers from mapped host memory", ggml_backend_buft_name(buft)));
-            }
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 void * addr = nullptr;
                 size_t first, last; // NOLINT
@@ -1966,9 +2036,29 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    ggml_backend_buffer_type_t forced_buft = nullptr;
+    if (params.moe_expert_cache_slots > 0 && params.rpc_moe_cache_remote && tn.bid >= 0) {
+        switch (tn.tensor) {
+            case LLM_TENSOR_FFN_DOWN_EXPS:
+            case LLM_TENSOR_FFN_GATE_EXPS:
+            case LLM_TENSOR_FFN_UP_EXPS:
+            case LLM_TENSOR_FFN_GATE_UP_EXPS:
+            case LLM_TENSOR_FFN_DOWN_CHEXPS:
+            case LLM_TENSOR_FFN_GATE_CHEXPS:
+            case LLM_TENSOR_FFN_UP_CHEXPS: {
+                const auto it = pimpl->moe_buft_by_device.find(pimpl->dev_layer.at(tn.bid).dev);
+                if (it != pimpl->moe_buft_by_device.end()) {
+                    forced_buft = it->second;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-        tn, ne, flags);
+        tn, ne, flags, forced_buft);
 }
 
 bool llama_model::graph_supports_recurrent_sparse_snapshots() const {

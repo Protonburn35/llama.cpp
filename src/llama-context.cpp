@@ -1683,7 +1683,38 @@ void llama_context::refresh_moe_candidates() {
     try {
         const llama_moe_candidate_snapshot candidates(model, *loras);
         for (const auto & endpoint : moe_candidate_replace_fns) {
-            const int32_t result = endpoint.second(endpoint.first, &candidates.get());
+            const auto & complete = candidates.get();
+            std::vector<ggml_backend_moe_candidate_tensor_v2> local_tensors;
+            local_tensors.reserve(complete.n_tensors);
+            const auto * endpoint_dev = ggml_backend_get_device(endpoint.first);
+            for (uint32_t i = 0; i < complete.n_tensors; ++i) {
+                const auto & record = complete.tensors[i];
+                if (record.tensor == nullptr || record.tensor->buffer == nullptr) {
+                    continue;
+                }
+
+                // Candidate registries are backend-local and validate the exact
+                // source tensor and buffer type.  In a layer split, forwarding a
+                // remote cache tensor to the local CUDA registry (or vice versa)
+                // makes the complete snapshot fail validation.  Preserve the
+                // global semantic group indices, but submit only records owned by
+                // this endpoint.  Ungrouped, non-cache tensors are only coverage
+                // annotations and do not need to be replicated to every backend.
+                const auto * buft = ggml_backend_buffer_get_type(record.tensor->buffer);
+                if (ggml_backend_buft_get_device(buft) != endpoint_dev) {
+                    continue;
+                }
+                if (record.group_index == UINT32_MAX &&
+                        (record.flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER) == 0) {
+                    continue;
+                }
+                local_tensors.push_back(record);
+            }
+
+            ggml_backend_moe_candidate_snapshot_v2 local = complete;
+            local.tensors = local_tensors.empty() ? nullptr : local_tensors.data();
+            local.n_tensors = static_cast<uint32_t>(local_tensors.size());
+            const int32_t result = endpoint.second(endpoint.first, &local);
             if (result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED &&
                     result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED) {
                 endpoint.second(endpoint.first, &disabled);
@@ -1744,6 +1775,26 @@ void llama_context::refresh_moe_layer_owners() {
     }
     moe_layer_owners   = std::move(owners);
     sched_need_reserve = true;
+
+    size_t cached_layers = 0;
+    for (const auto * owner : moe_layer_owners) {
+        cached_layers += owner != nullptr;
+    }
+    LLAMA_LOG_INFO("moe-cache-ownership: cached_layers=%zu/%zu required_grouped=%s\n",
+                   cached_layers, moe_layer_owners.size(),
+                   moe_required_grouped_execution_supported ? "supported" : "unavailable");
+    for (size_t first = 0; first < moe_layer_owners.size();) {
+        auto * owner = moe_layer_owners[first];
+        size_t last = first + 1;
+        while (last < moe_layer_owners.size() && moe_layer_owners[last] == owner) {
+            ++last;
+        }
+        if (owner != nullptr) {
+            LLAMA_LOG_INFO("moe-cache-ownership: layers=%zu-%zu owner=%s\n",
+                           first, last - 1, ggml_backend_name(owner));
+        }
+        first = last;
+    }
 }
 
 void llama_context::place_moe_regions(llm_graph_result * res) {

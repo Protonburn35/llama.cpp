@@ -1177,7 +1177,8 @@ struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL 
 
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        ggml_backend_buffer_type_t forced_buft) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
@@ -1291,10 +1292,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
         }
 
-        ggml_backend_buffer_type_t buft = nullptr;
+        ggml_backend_buffer_type_t buft = forced_buft;
+
+        if (buft != nullptr) {
+            LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type forced to %s\n",
+                    tn.str().c_str(), ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                    ggml_backend_buft_name(buft));
+        }
 
         // check overrides
-        if (tensor_buft_overrides) {
+        if (!buft && tensor_buft_overrides) {
             std::string tensor_name = tn.str();
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);

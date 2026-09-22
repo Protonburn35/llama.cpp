@@ -8371,6 +8371,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_cached_bounded_buffer_type;
     }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_FOR_DEVICE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_cached_buffer_type_for_device;
+    }
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_FREE_BUFFER_TYPE_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_cached_free_buffer_type;
     }
