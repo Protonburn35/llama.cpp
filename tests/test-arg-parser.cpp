@@ -260,6 +260,21 @@ static void test(void) {
     assert(params.moe_expert_cache_host_pinned_size == 0);
 
     params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--rpc-moe-cache-remote", "on", "--rpc-graph-cache-size", "4"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.rpc_moe_cache_remote);
+    assert(params.rpc_graph_cache_size == 4);
+    const auto rpc_mparams = common_model_params_to_llama(params);
+    assert(rpc_mparams.rpc_moe_cache_remote);
+    assert(rpc_mparams.rpc_graph_cache_size == 4);
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--rpc-moe-cache-remote", "invalid"};
+    assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--rpc-graph-cache-size", "0"};
+    assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--moe-early-router"};
     assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.moe_early_router);

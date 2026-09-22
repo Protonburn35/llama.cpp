@@ -406,6 +406,7 @@ void common_params_print_info(const common_params & params, bool print_devices) 
 
     const int verbosity = common_log_get_verbosity_thold();
     COM_INF("%s: verbosity = %d (adjust with the `-lv N` CLI arg)\n", __func__, verbosity);
+    COM_INF("%s: --rpc-moe-cache-remote = %s, --rpc-graph-cache-size = %d\n", __func__, params.rpc_moe_cache_remote ? "on" : "off", params.rpc_graph_cache_size);
 
     // device enumeration creates a primary context on CUDA backends, skip it when the caller does not own any device
     if (print_devices && verbosity >= LOG_LEVEL_TRACE) {
@@ -1294,6 +1295,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        auto * reg = ggml_backend_reg_get(i);
+        auto set_graph_cache_size = reinterpret_cast<ggml_backend_rpc_set_graph_cache_size_t>(
+            ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_SET_GRAPH_CACHE_SIZE_PROC_NAME));
+        if (set_graph_cache_size != nullptr) {
+            set_graph_cache_size(static_cast<size_t>(std::max(params.rpc_graph_cache_size, 1)));
+        }
+    }
+
     if (params.fit_params) {
         if (params.n_moe_expert_cache_slots > 0) {
             COM_WRN("%s", "--fit does not account for MoE expert cache pools; set -fit off and size --moe-expert-cache-size manually\n");
@@ -1716,6 +1726,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.n_gpu_layers          = params.n_gpu_layers;
     mparams.moe_expert_cache_slots = params.n_moe_expert_cache_slots;
     mparams.moe_expert_cache_host_pinned_size = params.moe_expert_cache_host_pinned_size;
+    mparams.rpc_graph_cache_size = params.rpc_graph_cache_size;
+    mparams.rpc_moe_cache_remote = params.rpc_moe_cache_remote;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;

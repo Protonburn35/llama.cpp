@@ -2985,6 +2985,7 @@ llama_model_params llama_model_default_params() {
         /*.n_gpu_layers                =*/ -1,
         /*.moe_expert_cache_slots      =*/ 0,
         /*.moe_expert_cache_host_pinned_size =*/ 0,
+        /*.rpc_graph_cache_size        =*/ 1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
@@ -3000,6 +3001,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.rpc_moe_cache_remote        =*/ false,
     };
 
     return result;

@@ -2882,6 +2882,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_HOST_PINNED_MB"));
     add_opt(common_arg(
+        {"--rpc-moe-cache-remote"}, "on|off",
+        "place RPC-owned MoE expert caches on the remote device (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.rpc_moe_cache_remote = true;
+            } else if (is_falsey(value)) {
+                params.rpc_moe_cache_remote = false;
+            } else {
+                throw std::invalid_argument("--rpc-moe-cache-remote must be 'on' or 'off'");
+            }
+        }
+    ).set_env("LLAMA_ARG_RPC_MOE_CACHE_REMOTE"));
+    add_opt(common_arg(
+        {"--rpc-graph-cache-size"}, "N",
+        "maximum number of graphs cached per RPC device (default: 1)",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("--rpc-graph-cache-size must be at least 1");
+            }
+            params.rpc_graph_cache_size = value;
+        }
+    ).set_env("LLAMA_ARG_RPC_GRAPH_CACHE_SIZE"));
+    add_opt(common_arg(
         {"--moe-early-router"},
         "MoE expert cache: predict the next layer's routed experts and prepack eligible adjacent groups (default: disabled)",
         [](common_params & params) {
