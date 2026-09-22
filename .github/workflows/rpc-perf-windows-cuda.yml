@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - rpc-perf/profile-coalesce-b324
+      - rpc-perf/distributed-moe-cache-b324
   workflow_dispatch:
 
 permissions:
@@ -51,14 +52,18 @@ jobs:
             -DCMAKE_CUDA_ARCHITECTURES="89-real;120a-real" ^
             -DLLAMA_BUILD_APP=OFF ^
             -DLLAMA_BUILD_EXAMPLES=OFF ^
-            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_TESTS=ON ^
             -DLLAMA_BUILD_TOOLS=ON ^
             -DLLAMA_BUILD_SERVER=ON ^
             -DLLAMA_BUILD_UI=OFF ^
             -DLLAMA_BUILD_BORINGSSL=ON
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           if %NINJA_JOBS% LSS 1 set NINJA_JOBS=1
-          cmake --build build --config Release -j %NINJA_JOBS% --target llama-server ggml-rpc-server ggml-cpu-x64 ggml-cuda ggml-rpc
+          cmake --build build --config Release -j %NINJA_JOBS% --target llama-server ggml-rpc-server ggml-cpu-x64 ggml-cuda ggml-rpc test-arg-parser
+
+      - name: Test runtime option parsing
+        shell: pwsh
+        run: .\build\bin\Release\test-arg-parser.exe
 
       - name: Package
         id: package
@@ -159,6 +164,10 @@ jobs:
             generator         = "Ninja Multi-Config"
             cudaToolkit       = $nvccVersion
             cudaArchitectures = @("89-real", "120a-real")
+            featureDefaults   = [ordered]@{
+              remoteMoeCache = "off"
+              rpcGraphCacheEntries = 1
+            }
             cmake             = (cmake --version | Select-Object -First 1).Trim()
             payloadFiles      = $payload
           }
