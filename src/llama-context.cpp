@@ -1700,7 +1700,7 @@ void llama_context::refresh_moe_candidates() {
                 // global semantic group indices, but submit only records owned by
                 // this endpoint.  Ungrouped, non-cache tensors are only coverage
                 // annotations and do not need to be replicated to every backend.
-                const auto * buft = ggml_backend_buffer_get_type(record.tensor->buffer);
+                auto * buft = ggml_backend_buffer_get_type(record.tensor->buffer);
                 if (ggml_backend_buft_get_device(buft) != endpoint_dev) {
                     continue;
                 }
