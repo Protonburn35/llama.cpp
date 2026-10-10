@@ -3047,7 +3047,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     }
     profile.record_graph_cache(false, stored.uid, graph_evictions, cache.capacity);
 
-    size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
+    size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes + n_tensors, false);
     if (stored.buffer.size() < buf_size) {
         stored.buffer.resize(buf_size);
     }
@@ -3059,7 +3059,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     ggml_context_ptr ctx_ptr { ggml_init(params) };
     GGML_ASSERT(ctx_ptr != nullptr);
     ggml_context * ctx = ctx_ptr.get();
-    struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_nodes, false);
+    struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_nodes + n_tensors, false);
     graph->n_nodes = n_nodes;
     graph->uid = header.graph_uid;
     if (has_certificate) {
@@ -3090,6 +3090,17 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             }
             const size_t hash_pos = ggml_hash_insert(&graph->visited_hash_set, graph->nodes[i]);
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
+        }
+    }
+    // leaf tensors are not graph nodes, but graph proofs need their use counts
+    for (uint32_t i = 0; i < n_tensors; i++) {
+        const auto found = tensor_map.find(tensors[i].id);
+        if (found == tensor_map.end() || found->second == nullptr) {
+            continue;
+        }
+        const size_t hash_pos = ggml_hash_insert(&graph->visited_hash_set, found->second);
+        if (hash_pos != GGML_HASHSET_ALREADY_EXISTS) {
+            graph->use_counts[hash_pos] = tensors[i].use_count;
         }
     }
     const uint64_t graph_start_ns = rpc_profile_enabled() ? rpc_profile_now_ns() : 0;

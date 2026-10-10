@@ -559,6 +559,21 @@ private:
         GROUP_REASON_MATERIALIZATION,
     };
 
+    enum unproven_site : uint32_t {
+        UNPROVEN_SITE_NONE = 0,
+        UNPROVEN_SITE_READER_MISSING,
+        UNPROVEN_SITE_READER_CONSUMERS_FULL,
+        UNPROVEN_SITE_READERS_FULL,
+        UNPROVEN_SITE_BANK_RANGE,
+        UNPROVEN_SITE_BANK_SLOT_RANGE,
+        UNPROVEN_SITE_CAPABILITY_MISMATCH,
+        UNPROVEN_SITE_ROUTE_NODES,
+        UNPROVEN_SITE_READER_USE,
+        UNPROVEN_SITE_BANK_ABSENT,
+        UNPROVEN_SITE_BANK_USE,
+        UNPROVEN_SITE_DOWN_ORDER,
+    };
+
     struct consumer_witness {
         const ggml_tensor * node;
         const ggml_tensor * src[3];
@@ -644,6 +659,7 @@ private:
         bool auxiliary;
         bool external_consumer;
         bool unproven;
+        uint32_t unproven_site;
         bool has_ids;
         bool prefill;
         bool decode;
@@ -676,6 +692,7 @@ private:
         reader_witness readers[MAX_GROUP_READERS];
         use_witness bank_uses[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS];
         uint32_t reason;
+        uint32_t unproven_site;
         uint32_t n_readers;
         uint32_t witness_reusable;
     };
